@@ -1,3 +1,4 @@
+#Long
 # Bot Chiếm lãnh thổ - bản hoàn thiện (Python 3.12, chỉ dùng thư viện chuẩn)
 # Biến môi trường do hệ thống đặt: API_URL, GAME_ID, PLAYER_ID, PLAYER_TOKEN.
 #
