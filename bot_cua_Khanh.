@@ -1,0 +1,1148 @@
+# ============================================================
+# OCEAN PREDATOR 5.0
+# Plan-Based Territory AI
+# Python 3.12 - Standard Library Only
+# ============================================================
+
+import json
+import os
+import time
+import urllib.request
+import urllib.error
+from collections import deque
+import traceback
+
+API = os.environ["API_URL"]
+GAME = os.environ["GAME_ID"]
+ME = os.environ["PLAYER_ID"]
+TOKEN = os.environ["PLAYER_TOKEN"]
+
+DIRS = {
+    "up": (0, -1),
+    "right": (1, 0),
+    "down": (0, 1),
+    "left": (-1, 0)
+}
+
+REVERSE = {
+    "up": "down",
+    "down": "up",
+    "left": "right",
+    "right": "left"
+}
+
+PERPENDICULAR = {
+    "up": ["right", "left"],
+    "right": ["down", "up"],
+    "down": ["left", "right"],
+    "left": ["up", "down"]
+}
+
+ACTIVE_PLAN = []
+ACTIVE_TARGET = None
+# Ghi nhớ những vị trí bot vừa đi qua
+RECENT_CELLS = deque(maxlen=250)
+RECENT_FIRST_DIRS = deque(maxlen=8)
+
+
+def remember_position(me):
+    pos = (me["x"], me["y"])
+
+    if not RECENT_CELLS or RECENT_CELLS[-1] != pos:
+        RECENT_CELLS.append(pos)
+
+    for p in me.get("trail", []):
+        p = tuple(p)
+
+        if not RECENT_CELLS or RECENT_CELLS[-1] != p:
+            RECENT_CELLS.append(p)
+
+# ============================================================
+# API
+# ============================================================
+
+def get(path):
+    with urllib.request.urlopen(
+        f"{API}/game/{GAME}{path}", timeout=5
+    ) as res:
+        return json.load(res)
+
+
+def act(action, body=None):
+    req = urllib.request.Request(
+        f"{API}/game/{GAME}/player/{ME}/{action}",
+        data=json.dumps(body or {}).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "x-player-token": TOKEN
+        },
+        method="POST"
+    )
+
+    try:
+        urllib.request.urlopen(req, timeout=5).close()
+    except urllib.error.HTTPError as err:
+        print("Lệnh bị từ chối:", err.code, flush=True)
+
+
+# ============================================================
+# BASIC UTILITIES
+# ============================================================
+
+def valid(x, y, w, h):
+    return 0 <= x < w and 0 <= y < h
+
+
+def owner_at(state, x, y):
+    owner = state.get("owner", [])
+
+    if 0 <= y < len(owner) and 0 <= x < len(owner[y]):
+        return owner[y][x]
+
+    return None
+
+
+def own_land(state, me, x, y):
+    value = owner_at(state, x, y)
+    return value is not None and str(value) == str(me["index"])
+
+
+def get_rule(state, names, default):
+    rules = state.get("rules", {})
+
+    if not isinstance(rules, dict):
+        return default
+
+    for name in names:
+        if name in rules:
+            return rules[name]
+
+    return default
+
+
+def build_blocked(state, me):
+    my_trail = {tuple(p) for p in me.get("trail", [])}
+    enemy_trails = set()
+    enemy_positions = set()
+    enemy_trail_owner = {}
+
+    for p in state.get("players", []):
+        if p["playerId"] == ME:
+            continue
+
+        enemy_positions.add((p["x"], p["y"]))
+
+        for pos in p.get("trail", []):
+            pos = tuple(pos)
+            enemy_trails.add(pos)
+            enemy_trail_owner[pos] = p
+
+    obstacles = set()
+
+    for p in state.get("obstacles", []):
+        if isinstance(p, (list, tuple)) and len(p) >= 2:
+            obstacles.add((p[0], p[1]))
+
+    return {
+        "my_trail": my_trail,
+        "enemy_trails": enemy_trails,
+        "enemy_trail_owner": enemy_trail_owner,
+        "enemy_positions": enemy_positions,
+        "obstacles": obstacles
+    }
+
+
+def is_blocked(state, x, y, blocked, enemy_trail=True):
+    w, h = state["width"], state["height"]
+
+    if not valid(x, y, w, h):
+        return True
+
+    pos = (x, y)
+
+    if pos in blocked["my_trail"]:
+        return True
+
+    if pos in blocked["obstacles"]:
+        return True
+
+    if pos in blocked["enemy_positions"]:
+        return True
+
+    if enemy_trail and pos in blocked["enemy_trails"]:
+        return True
+
+    return False
+
+
+def valid_moves(state, me, blocked):
+    moves = []
+    last = me.get("lastDir")
+
+    for direction, (dx, dy) in DIRS.items():
+        if last and direction == REVERSE.get(last):
+            continue
+
+        nx = me["x"] + dx
+        ny = me["y"] + dy
+
+        if is_blocked(state, nx, ny, blocked):
+            continue
+
+        moves.append((direction, nx, ny))
+
+    return moves
+
+
+# ============================================================
+# BFS: RETURN HOME
+# ============================================================
+
+def bfs_home(state, me, blocked, sx=None, sy=None, last=None):
+    w, h = state["width"], state["height"]
+
+    if sx is None:
+        sx, sy = me["x"], me["y"]
+
+    queue = deque()
+    visited = set()
+
+    queue.append((sx, sy, last, [], []))
+    visited.add((sx, sy, last))
+
+    while queue:
+        x, y, previous, directions, path = queue.popleft()
+
+        if own_land(state, me, x, y):
+            return directions, path
+
+        for direction, (dx, dy) in DIRS.items():
+            if previous and direction == REVERSE.get(previous):
+                continue
+
+            nx, ny = x + dx, y + dy
+
+            if is_blocked(state, nx, ny, blocked):
+                continue
+
+            node = (nx, ny, direction)
+
+            if node in visited:
+                continue
+
+            visited.add(node)
+
+            queue.append((
+                nx, ny, direction,
+                directions + [direction],
+                path + [(nx, ny)]
+            ))
+
+    return None
+
+
+# ============================================================
+# ENEMY DISTANCE MAP
+# ============================================================
+
+def enemy_distance_map(state, enemy, blocked):
+    w, h = state["width"], state["height"]
+
+    start = (enemy["x"], enemy["y"])
+    dist = {start: 0}
+    queue = deque([start])
+
+    while queue:
+        x, y = queue.popleft()
+
+        for dx, dy in DIRS.values():
+            nx, ny = x + dx, y + dy
+            pos = (nx, ny)
+
+            if not valid(nx, ny, w, h):
+                continue
+
+            if pos in blocked["obstacles"]:
+                continue
+
+            if pos in dist:
+                continue
+
+            dist[pos] = dist[(x, y)] + 1
+            queue.append(pos)
+
+    delay = max(
+        enemy.get("stun", 0),
+        enemy.get("freeze", 0)
+    )
+
+    wing = enemy.get("wing", 0) > 0
+
+    result = {}
+
+    for pos, distance in dist.items():
+        if wing:
+            distance = (distance + 1) // 2
+
+        result[pos] = delay + distance
+
+    return result
+
+
+def build_enemy_maps(state, blocked):
+    maps = []
+
+    for enemy in state.get("players", []):
+        if enemy["playerId"] == ME:
+            continue
+
+        maps.append((
+            enemy,
+            enemy_distance_map(state, enemy, blocked)
+        ))
+
+    return maps
+
+
+# ============================================================
+# FLOOD FILL: TERRITORY ESTIMATION
+# ============================================================
+
+def estimate_area(state, me, path, blocked, mode):
+    w, h = state["width"], state["height"]
+
+    walls = set(path)
+
+    # Lãnh thổ của mình cũng là tường.
+    for y in range(h):
+        for x in range(w):
+            if own_land(state, me, x, y):
+                walls.add((x, y))
+
+    # Vật cản KHÔNG phải tường.
+    # Flood Fill vẫn lan xuyên qua vật cản.
+
+    visited = set()
+    queue = deque()
+
+    for x in range(w):
+        for y in (0, h - 1):
+            pos = (x, y)
+
+            if pos not in walls and pos not in visited:
+                visited.add(pos)
+                queue.append(pos)
+
+    for y in range(h):
+        for x in (0, w - 1):
+            pos = (x, y)
+
+            if pos not in walls and pos not in visited:
+                visited.add(pos)
+                queue.append(pos)
+
+    while queue:
+        x, y = queue.popleft()
+
+        for dx, dy in DIRS.values():
+            nx, ny = x + dx, y + dy
+            pos = (nx, ny)
+
+            if not valid(nx, ny, w, h):
+                continue
+
+            if pos in walls or pos in visited:
+                continue
+
+            visited.add(pos)
+            queue.append(pos)
+
+    weights = {
+        "safe": 1.3,
+        "balanced": 1.8,
+        "attack": 2.6
+    }
+
+    enemy_weight = weights[mode]
+
+    area = 0
+    enemy_area = 0
+
+    for y in range(h):
+        for x in range(w):
+            pos = (x, y)
+
+            if pos in walls or pos in visited:
+                continue
+
+            if pos in blocked["obstacles"]:
+                continue
+
+            value = owner_at(state, x, y)
+
+            if value is None:
+                area += 1
+            elif str(value) != str(me["index"]):
+                area += enemy_weight
+                enemy_area += 1
+
+    return area, enemy_area
+
+
+# ============================================================
+# SLACK: PLAN SAFETY
+# ============================================================
+
+def evaluate_slack(path, enemy_maps):
+    if not enemy_maps or not path:
+        return 100
+
+    minimum = 100
+
+    for i, pos in enumerate(path):
+        pos = tuple(pos)
+
+        # Thời điểm bot đến vị trí này.
+        my_time = i + 1
+
+        for enemy, distances in enemy_maps:
+            enemy_time = distances.get(pos, 999)
+            slack = enemy_time - my_time
+
+            minimum = min(minimum, slack)
+
+    return minimum
+
+
+# ============================================================
+# AUTOMATIC MODE
+# ============================================================
+
+def choose_mode(state, me):
+    players = state.get("players", [])
+
+    if not players:
+        return "balanced"
+
+    my_score = me.get("score", me.get("area", 0))
+
+    highest = my_score
+
+    for p in players:
+        if p["playerId"] == ME:
+            continue
+
+        highest = max(
+            highest,
+            p.get("score", p.get("area", 0))
+        )
+
+    difference = my_score - highest
+
+    w = state["width"]
+    h = state["height"]
+    total = w * h
+
+    turn = state.get("currentTurn", 0)
+    max_turns = get_rule(
+        state,
+        ["maxTurns", "totalTurns", "turnLimit"],
+        999999
+    )
+
+    if not isinstance(max_turns, (int, float)):
+        max_turns = 999999
+
+    progress = turn / max(1, max_turns)
+
+    if progress < 0.12:
+        return "balanced"
+
+    if progress >= 0.80:
+        if difference > 0:
+            return "safe"
+
+        if abs(difference) > total * 0.03:
+            return "attack"
+
+        return "balanced"
+
+    if difference > total * 0.08:
+        return "safe"
+
+    if difference < -total * 0.06:
+        return "attack"
+
+    return "balanced"
+
+
+# ============================================================
+# PLAN GENERATOR
+# ============================================================
+
+def generate_plans(state, me, blocked, enemy_maps, mode):
+    plans = []
+
+    max_out = {
+        "safe": 5,
+        "balanced": 8,
+        "attack": 11
+    }[mode]
+
+    max_side = {
+        "safe": 8,
+        "balanced": 10,
+        "attack": 13
+    }[mode]
+
+    margin = {
+        "safe": 3,
+        "balanced": 2,
+        "attack": 1
+    }[mode]
+
+    max_trail = get_rule(
+        state,
+        ["maxTrail", "trailLimit"],
+        120
+    )
+
+    max_turns = get_rule(
+        state,
+        ["maxTurns", "totalTurns", "turnLimit"],
+        999999
+    )
+
+    current_turn = state.get("currentTurn", 0)
+    remaining_turns = max_turns - current_turn
+
+    sx, sy = me["x"], me["y"]
+    last = me.get("lastDir")
+
+    # Giảm số phép thử để giữ thời gian tính toán thấp.
+    for first in DIRS:
+        if last and first == REVERSE.get(last):
+            continue
+
+        dx, dy = DIRS[first]
+
+        for second in PERPENDICULAR[first]:
+
+            for a in range(1, max_out + 1):
+                for b in range(1, max_side + 1):
+
+                    x = sx + dx * a
+                    y = sy + dy * a
+
+                    if not valid(
+                        x, y, state["width"], state["height"]
+                    ):
+                        break
+
+                    outbound = []
+                    directions = []
+                    valid_plan = True
+
+                    # Đi thẳng đoạn thứ nhất.
+                    cx, cy = sx, sy
+
+                    for _ in range(a):
+                        cx += dx
+                        cy += dy
+
+                        if is_blocked(
+                            state, cx, cy, blocked
+                        ):
+                            valid_plan = False
+                            break
+
+                        if own_land(state, me, cx, cy):
+                            valid_plan = False
+                            break
+
+                        outbound.append((cx, cy))
+                        directions.append(first)
+
+                    if not valid_plan:
+                        continue
+
+                    # Đi ngang đoạn thứ hai.
+                    dx2, dy2 = DIRS[second]
+
+                    for _ in range(b):
+                        cx += dx2
+                        cy += dy2
+
+                        if is_blocked(
+                            state, cx, cy, blocked
+                        ):
+                            valid_plan = False
+                            break
+
+                        if own_land(state, me, cx, cy):
+                            valid_plan = False
+                            break
+
+                        outbound.append((cx, cy))
+                        directions.append(second)
+
+                    if not valid_plan:
+                        continue
+
+                    # Không cho đường về đi xuyên qua đường vừa vẽ.
+                    return_blocked = dict(blocked)
+                    return_blocked["my_trail"] = (
+                        blocked["my_trail"] | set(outbound)
+                    )
+
+                    result = bfs_home(
+                        state, me, return_blocked,
+                        cx, cy, second
+                    )
+
+                    if result is None:
+                        continue
+
+                    return_dirs, return_path = result
+
+                    full_path = outbound + return_path
+                    full_dirs = directions + return_dirs
+
+                    length = len(full_path)
+
+                    if length == 0:
+                        continue
+
+                    if length > max_trail:
+                        continue
+
+                    if length > remaining_turns:
+                        continue
+
+                    # Kiểm tra đường về không cắt chính mình.
+                    if len(set(full_path)) != len(full_path):
+                        continue
+
+                    slack = evaluate_slack(
+                        full_path, enemy_maps
+                    )
+
+                    if slack < margin:
+                        continue
+
+                    area, enemy_area = estimate_area(
+                        state, me, full_path,
+                        blocked, mode
+                    )
+
+                    if area <= 0:
+                        continue
+
+                    plans.append({
+                        "directions": full_dirs,
+                        "path": full_path,
+                        "length": length,
+                        "area": area,
+                        "enemy_area": enemy_area,
+                        "slack": slack
+                    })
+
+    return plans
+
+
+# ============================================================
+# PLAN SCORING
+# ============================================================
+
+def score_plan(plan):
+    # Giá trị đất chiếm được / thời gian.
+    value = plan["area"]
+
+    # Thưởng thêm cho việc cướp đất đối thủ.
+    value += plan["enemy_area"] * 0.5
+
+    return value / (plan["length"] + 2)
+
+
+def choose_plan(plans):
+    if not plans:
+        return None
+
+    plans.sort(
+        key=lambda p: score_plan(p),
+        reverse=True
+    )
+
+    return plans[0]
+
+
+# ============================================================
+# ITEM EVALUATION
+# ============================================================
+
+def item_value(item, enemy_count):
+    kind = str(
+        item.get("type", item.get("kind", ""))
+    ).lower()
+
+    values = {
+        "saber": 65,
+        "megabomb": 55 * max(1, enemy_count) * 0.5,
+        "hourglass": 35,
+        "bomb": 30,
+        "wing": 25
+    }
+
+    for name, value in values.items():
+        if name in kind:
+            return value
+
+    return 15
+
+
+def item_bonus(state, path, enemy_maps):
+    items = state.get("items", [])
+
+    if not isinstance(items, list) or not path:
+        return 0
+
+    bonus = 0
+    enemy_count = len(enemy_maps)
+
+    path_positions = {
+        tuple(pos): i + 1
+        for i, pos in enumerate(path)
+    }
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+
+        x = item.get("x")
+        y = item.get("y")
+
+        if x is None or y is None:
+            continue
+
+        pos = (x, y)
+
+        if pos not in path_positions:
+            continue
+
+        my_time = path_positions[pos]
+
+        enemy_time = min(
+            (
+                distances.get(pos, 999)
+                for _, distances in enemy_maps
+            ),
+            default=999
+        )
+
+        if my_time < enemy_time:
+            bonus += item_value(item, enemy_count)
+
+    return bonus
+
+
+# ============================================================
+# CUT ENEMY TRAIL
+# ============================================================
+
+def find_cut(state, me, moves, blocked, enemy_maps, mode):
+    values = {
+        "safe": 12,
+        "balanced": 16,
+        "attack": 22
+    }
+
+    best = None
+    best_score = 0
+
+    for direction, nx, ny in moves:
+        pos = (nx, ny)
+
+        if pos not in blocked["enemy_trails"]:
+            continue
+
+        enemy = blocked["enemy_trail_owner"].get(pos)
+
+        if enemy is None:
+            continue
+
+        # Không lao vào nếu đối thủ có thể tiếp cận ngay.
+        enemy_time = min(
+            (
+                distances.get(pos, 999)
+                for other, distances in enemy_maps
+                if other["playerId"] != enemy["playerId"]
+            ),
+            default=999
+        )
+
+        if enemy_time <= 1:
+            continue
+
+        score = values[mode]
+
+        if enemy.get("score", 0) > me.get("score", 0):
+            score *= 1.6
+
+        if score > best_score:
+            best_score = score
+            best = direction
+
+    return best
+
+
+# ============================================================
+# EMERGENCY RETURN
+# ============================================================
+
+def emergency_return(state, me, blocked, moves):
+    result = bfs_home(
+        state, me, blocked,
+        me["x"], me["y"],
+        me.get("lastDir")
+    )
+
+    if result is None:
+        return None
+
+    directions, path = result
+
+    if not directions:
+        return None
+
+    return directions[0]
+
+
+# ============================================================
+# DECIDE
+# ============================================================
+
+def decide(state):
+    global ACTIVE_PLAN, ACTIVE_TARGET
+
+    try:
+        me = next(
+            (
+                p for p in state["players"]
+                if p["playerId"] == ME
+            ),
+            None
+        )
+
+        if me is None:
+            return None
+
+        items = state.get("items", [])
+
+        if items:
+            print(
+                "[PREDATOR] ITEM DEBUG:",
+                json.dumps(items, ensure_ascii=False),
+                flush=True
+            )
+
+        remember_position(me)
+
+        if me.get("stun", 0) > 0:
+            ACTIVE_PLAN = []
+            return None
+
+        if me.get("freeze", 0) > 0:
+            ACTIVE_PLAN = []
+            return None
+
+        blocked = build_blocked(state, me)
+        moves = valid_moves(state, me, blocked)
+
+        if not moves:
+            return None
+
+        enemy_maps = build_enemy_maps(state, blocked)
+        mode = choose_mode(state, me)
+
+        trail = me.get("trail", [])
+
+        max_trail = get_rule(
+            state,
+            ["maxTrail", "trailLimit"],
+            120
+        )
+
+        max_turns = get_rule(
+            state,
+            ["maxTurns", "totalTurns", "turnLimit"],
+            999999
+        )
+
+        current_turn = state.get("currentTurn", 0)
+        remaining = max_turns - current_turn
+
+        # ----------------------------------------
+        # 1. ĐANG CÓ ĐƯỜNG VẼ
+        # ----------------------------------------
+
+        if trail:
+            ACTIVE_TARGET = None
+
+            result = bfs_home(
+                state, me, blocked,
+                me["x"], me["y"],
+                me.get("lastDir")
+            )
+
+            if result is None:
+                ACTIVE_PLAN = []
+                return None
+
+            return_dirs, return_path = result
+            return_distance = len(return_dirs)
+
+            margin = {
+                "safe": 3,
+                "balanced": 2,
+                "attack": 1
+            }[mode]
+
+            slack = evaluate_slack(
+                trail + return_path,
+                enemy_maps
+            )
+
+            must_return = (
+                len(trail) + return_distance
+                >= max_trail - margin
+                or return_distance >= remaining
+                or slack < margin
+            )
+
+            if must_return:
+                ACTIVE_PLAN = []
+
+                print(
+                    "[PREDATOR 5.0] EMERGENCY RETURN",
+                    "Trail=", len(trail),
+                    "Distance=", return_distance,
+                    "Slack=", slack,
+                    flush=True
+                )
+
+                return return_dirs[0] if return_dirs else None
+
+            # Kiểm tra kế hoạch cũ.
+            if ACTIVE_PLAN:
+                next_dir = ACTIVE_PLAN[0]
+
+                if any(m[0] == next_dir for m in moves):
+                    ACTIVE_PLAN.pop(0)
+                    return next_dir
+
+            # Kế hoạch cũ không còn hợp lệ.
+            ACTIVE_PLAN = []
+
+            return return_dirs[0] if return_dirs else None
+
+        # ----------------------------------------
+        # 2. ĐANG Ở TRONG LÃNH THỔ
+        # ----------------------------------------
+
+        ACTIVE_PLAN = []
+
+        # Ưu tiên cắt đường vẽ nếu cơ hội an toàn.
+        cut = find_cut(
+            state, me, moves,
+            blocked, enemy_maps, mode
+        )
+
+        if cut is not None:
+            print(
+                "[PREDATOR 5.0] CUT",
+                cut,
+                flush=True
+            )
+            return cut
+
+        # Sinh kế hoạch mới.
+        plans = generate_plans(
+            state, me, blocked,
+            enemy_maps, mode
+        )
+
+        # Thêm giá trị vật phẩm vào điểm.
+        for plan in plans:
+            bonus = item_bonus(
+                state, plan["path"], enemy_maps
+            )
+
+            # Ưu tiên những vị trí chưa đi qua gần đây.
+            new_cells = sum(
+                1 for pos in plan["path"]
+                if tuple(pos) not in RECENT_CELLS
+            )
+
+            repeated_cells = len(plan["path"]) - new_cells
+
+            # Khuyến khích khám phá, hạn chế đi lại.
+            exploration_bonus = new_cells * 0.8
+            exploration_penalty = repeated_cells * 1.5
+
+            # Hạn chế chọn liên tục cùng một hướng xuất phát.
+            first_direction = (
+                plan["directions"][0]
+                if plan["directions"] else None
+            )
+
+            direction_penalty = (
+                RECENT_FIRST_DIRS.count(first_direction) * 3
+                if first_direction else 0
+            )
+
+            plan["score"] = (
+                plan["area"]
+                + bonus
+                + exploration_bonus
+                - exploration_penalty
+                - direction_penalty
+            ) / (plan["length"] + 2)
+
+        best = max(
+            plans,
+            key=lambda p: p["score"],
+            default=None
+        )
+
+        if best is not None:
+            if best["directions"]:
+                RECENT_FIRST_DIRS.append(best["directions"][0])
+
+            ACTIVE_PLAN = best["directions"][:]
+
+            first = ACTIVE_PLAN.pop(0)
+
+            print(
+                "[PREDATOR 5.0] NEW PLAN",
+                "Mode=", mode,
+                "Area=", round(best["area"], 1),
+                "Length=", best["length"],
+                "Slack=", best["slack"],
+                "Score=", round(best["score"], 2),
+                flush=True
+            )
+
+            return first
+
+        # ----------------------------------------
+        # 3. KHÔNG TÌM ĐƯỢC KẾ HOẠCH
+        # ----------------------------------------
+
+        # Không đi ngẫu nhiên ra ngoài lãnh thổ.
+        # Chỉ chọn bước đi hợp lệ có nhiều lối thoát.
+        best_move = None
+        best_score = -999
+
+        for direction, nx, ny in moves:
+            exits = 0
+
+            for next_dir, (dx, dy) in DIRS.items():
+                if next_dir == REVERSE[direction]:
+                    continue
+
+                tx, ty = nx + dx, ny + dy
+
+                if not is_blocked(
+                    state, tx, ty, blocked
+                ):
+                    exits += 1
+
+            score = exits * 10
+
+            if me.get("lastDir") == direction:
+                score += 2
+
+            if score > best_score:
+                best_score = score
+                best_move = direction
+
+        print(
+            "[PREDATOR 5.0] NO PLAN",
+            "Mode=", mode,
+            flush=True
+        )
+
+        return best_move
+
+    except Exception as err:
+        print(
+            "[PREDATOR 5.0] DECIDE ERROR:",
+            repr(err),
+            flush=True
+        )
+
+        traceback.print_exc()
+
+        ACTIVE_PLAN = []
+        return None
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    print(
+        "OCEAN PREDATOR 5.0 STARTED",
+        ME, GAME,
+        flush=True
+    )
+
+    last_turn = -1
+
+    while True:
+        try:
+            status = get("/status")
+
+            if status["status"] == "finished":
+                print(
+                    "Trận đã kết thúc ở lượt",
+                    status["currentTurn"],
+                    flush=True
+                )
+                return
+
+            if (
+                status["status"] == "playing"
+                and status["currentTurn"] != last_turn
+            ):
+                last_turn = status["currentTurn"]
+
+                state = get("/state")
+                direction = decide(state)
+
+                if direction:
+                    act("move", {"direction": direction})
+
+                    print(
+                        "Lượt", last_turn + 1,
+                        "đi", direction,
+                        flush=True
+                    )
+
+            time.sleep(
+                min(
+                    0.25,
+                    max(
+                        0.05,
+                        (status.get("tickInterval") or 500) / 4000
+                    )
+                )
+            )
+
+        except Exception as err:
+            print("Lỗi:", err, flush=True)
+            time.sleep(1)
+
+
+main()
