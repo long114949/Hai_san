@@ -54,12 +54,12 @@ def is_occupied_by_other(ctx,index):
 def is_near_active_enemy(ctx,index):
     return index in ctx.get('enemyReach1',())or index in ctx.get('enemyReach2',())
 def next_cell(ctx,index,direction):
-    x,y=index_to_coord(ctx,index)
+    w,h=ctx['width'],ctx['height']
     dx,dy=DELTA[direction]
-    nx,ny=(x+dx,y+dy)
-    if nx<0 or ny<0 or nx>=ctx['width']or(ny>=ctx['height']):
+    x=index%w
+    if (dx<0 and x==0)or(dx>0 and x==w-1)or(dy<0 and index<w)or(dy>0 and index>=w*(h-1)):
         return-1
-    nxt=coord_to_index(ctx,nx,ny)
+    nxt=index+dy*w+dx
     if ctx['blocked'][nxt]:
         return-1
     return nxt
@@ -634,13 +634,13 @@ def build_home_field(ctx,max_distance=64):
             q.append(nxt)
     return(dist,next_home,occupied)
 def direction_between(ctx,a,b):
-    ax,ay=index_to_coord(ctx,a)
-    bx,by=index_to_coord(ctx,b)
-    if bx>ax:
+    w=ctx['width']
+    delta=b-a
+    if delta==1 and a//w==b//w:
         return 'right'
-    if bx<ax:
+    if delta==-1 and a//w==b//w:
         return 'left'
-    if by>ay:
+    if delta==w:
         return 'down'
     return 'up'
 def reconstruct_home_route(ctx,endpoint,home_field,forbidden,previous_direction,occupied):
@@ -754,13 +754,21 @@ def pending_slash_hits(ctx,trail_cells,plan_turns):
                 return True
     return False
 def enemy_home_center(ctx,enemy):
-    for key in('home','base','spawn'):
-        value=enemy.get(key)
+    cache=ctx.setdefault('_enemyHomeCenter',{})
+    key=enemy.get('index')
+    if key in cache:
+        return cache[key]
+    for field in('home','base','spawn'):
+        value=enemy.get(field)
         if isinstance(value,dict)and 'x' in value and('y' in value):
-            return(int(value['x']),int(value['y']))
+            result=(int(value['x']),int(value['y']))
+            cache[key]=result
+            return result
     for xk,yk in(('homeX','homeY'),('baseX','baseY'),('spawnX','spawnY')):
         if xk in enemy and yk in enemy:
-            return(int(enemy[xk]),int(enemy[yk]))
+            result=(int(enemy[xk]),int(enemy[yk]))
+            cache[key]=result
+            return result
     w,h,owner=(ctx['width'],ctx['height'],enemy['index'])
     best=None
     for y0 in range(max(1,h-4)):
@@ -772,8 +780,11 @@ def enemy_home_center(ctx,enemy):
             if best is None or candidate>best:
                 best=candidate
     if best and best[0]>0:
-        return(best[2],best[3])
-    return(int(enemy.get('x',0)),int(enemy.get('y',0)))
+        result=(best[2],best[3])
+    else:
+        result=(int(enemy.get('x',0)),int(enemy.get('y',0)))
+    cache[key]=result
+    return result
 def bomb_damage_value(ctx,size,leader_index):
     w,h=(ctx['width'],ctx['height'])
     total=0.0
@@ -1091,12 +1102,12 @@ def beam_route_candidates(ctx,mode,home_field,occupied,max_trail,counts):
         depth_cap=min(34,depth_cap+2)
     depth_limit=min(depth_cap,max(10,mode['maxOut']+mode['maxSide']),mode.get('remaining',depth_cap))
     beam_width=mode.get('beamWidth',36)
-    beam=[(start,ctx['me'].get('lastDir'),[],[],frozenset(),False,0.0)]
+    beam=[(start,ctx['me'].get('lastDir'),[],[],frozenset(),False,0,0.0)]
     candidates=[]
     seen_candidates=set()
     for depth in range(depth_limit):
         expanded=[]
-        for pos,prev,dirs,cells,visited,left_home,_ in beam:
+        for pos,prev,dirs,cells,visited,left_home,turn_count,_ in beam:
             for direction in DIRECTIONS:
                 if prev and OPPOSITE[direction]==prev:
                     continue
@@ -1126,7 +1137,7 @@ def beam_route_candidates(ctx,mode,home_field,occupied,max_trail,counts):
                 for n in(nxt-1 if x else-1,nxt+1 if x+1<ctx['width']else-1,nxt-ctx['width']if y else-1,nxt+ctx['width']if y+1<ctx['height']else-1):
                     if n>=0 and(not ctx['blocked'][n])and(ctx['grid'][n]==EMPTY)and(n not in new_visited):
                         frontier+=1
-                turns=sum((1 for a,b in zip(new_dirs,new_dirs[1:])if a!=b))
+                turns=turn_count+(1 if dirs and direction!=prev else 0)
                 zigzag=False
                 if len(new_dirs)>=3:
                     a0,b0,c0=new_dirs[-3:]
@@ -1136,14 +1147,14 @@ def beam_route_candidates(ctx,mode,home_field,occupied,max_trail,counts):
                     hval-=0.85
                 if ctx['grid'][nxt]>=0 and ctx['grid'][nxt]!=my_idx:
                     hval+=0.25
-                expanded.append((nxt,direction,new_dirs,new_cells,new_visited,outside,hval))
+                expanded.append((nxt,direction,new_dirs,new_cells,new_visited,outside,turns,hval))
         if not expanded:
             break
-        expanded.sort(key=lambda z:z[6],reverse=True)
+        expanded.sort(key=lambda z:z[7],reverse=True)
         picked,buckets=([],set())
         for state in expanded:
             ds=state[2]
-            turns=sum(a!=b for a,b in zip(ds,ds[1:]))
+            turns=state[6]
             shape=min(3,turns//2)
             key=(ds[0],shape)
             if key not in buckets:
